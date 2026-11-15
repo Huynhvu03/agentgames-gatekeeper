@@ -1,0 +1,8 @@
+# .env (real HMAC secret) — never commit
+.env
+# Runtime state (seen task ids / used proof refs) — local only
+state.json
+# Node modules
+node_modules/
+# Test artefacts
+/tmp/
