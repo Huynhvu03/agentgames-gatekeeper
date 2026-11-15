@@ -1,0 +1,1 @@
+{"dependencies":{"dotenv":"^16.4.5","snarkjs":"0.7.6"},"description":"LogiGatekeeper — Proof Gatekeeper agent for zkVerify Agent Games (Season 01)","engines":{"node":">=18"},"license":"MIT","main":"server.js","name":"logigatekeeper","scripts":{"start":"node server.js","test":"node test-server.js"},"version":"1.0.0"}
