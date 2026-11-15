@@ -15,6 +15,11 @@
  *   APPROVE only if every check passes, otherwise REJECT. Fail closed.
  * A Groth16 proof of the decision is generated locally with snarkjs and the
  * tournament's own gatekeeper circuit, and returned with the response.
+ * The proof is ALSO submitted to zkVerify via Kurier (see kurier.js) so the
+ * platform gets a finalized on-chain proof reference (proof_tx) — without
+ * it, scored rounds count every correct decision as "missing proof" (-2)
+ * and no reliability bonus is earned (Round 03 lesson). If Kurier is down
+ * or unconfigured, the response still carries decision + inline proof.
  */
 'use strict';
 
@@ -26,6 +31,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const snarkjs = require('snarkjs');
+const kurier = require('./kurier');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const HMAC_SECRET = process.env.AGENT_GAMES_HMAC_SECRET || '';
@@ -323,10 +329,39 @@ async function handleAgent(req, res) {
     state.usedProofRefs[proofRef] = taskId;
     saveState();
   }
-  return finishTask(res, taskId, input, approve, reason, proofData, started);
+
+  // Submit the decision proof to zkVerify via Kurier so the platform gets
+  // a finalized on-chain proof reference (proof_tx). Fail-safe: any Kurier
+  // error/timeout just means proofTx stays null and the response still
+  // carries decision + inline proof. The Kurier phase is capped so the
+  // 60 s platform deadline (55 s internal guard) is never threatened.
+  let proofTx = null;
+  if (kurier.isConfigured()) {
+    const elapsedMs = Date.now() - started;
+    const internalLeftMs = TASK_TIMEOUT_MS - elapsedMs;
+    const platformLeftMs = !Number.isNaN(deadlineMs) ? deadlineMs - Date.now() : Infinity;
+    const budgetMs = Math.min(kurier.KURIER_POLL_BUDGET_MS, internalLeftMs - 10_000, platformLeftMs - 10_000);
+    if (budgetMs >= 3000) {
+      try {
+        const res = await kurier.submitProof({
+          proof: proofData.proof,
+          publicSignals: proofData.publicSignals,
+          vkObject: getVk(),
+          budgetMs,
+        });
+        proofTx = res.proofTx;
+        console.log('[agent] kurier task', taskId, res.reason ? `no proof_tx (${res.reason})` : `proof_tx=${proofTx}`, 'job', res.jobId, 'status', res.status);
+      } catch (e) {
+        console.error('[agent] kurier submission threw for', taskId, ':', (e && e.message) || e, '-> answering without proof_tx');
+      }
+    } else {
+      console.log('[agent] kurier skipped for', taskId, '- not enough time left in the 60 s window (budget', budgetMs, 'ms)');
+    }
+  }
+  return finishTask(res, taskId, input, approve, reason, proofData, started, proofTx);
 }
 
-function finishTask(res, taskId, input, approve, reason, proofData, started) {
+function finishTask(res, taskId, input, approve, reason, proofData, started, proofTx) {
   const decision = approve ? 'APPROVE' : 'REJECT';
   // Field-name hedge: the task envelope the platform sends is snake_case,
   // but the preflight reply it expects is camelCase (protocolVersion), so the
@@ -341,8 +376,16 @@ function finishTask(res, taskId, input, approve, reason, proofData, started) {
     obj.proof = proofData.proof;
     obj.public_signals = proofData.publicSignals;
     obj.publicSignals = proofData.publicSignals;
-    // proof_tx is optional: no Kurier key is configured, so the decision
-    // proof is returned for the platform to verify directly (see README).
+    // proof_tx: the finalized on-chain reference for THIS decision proof,
+    // from Kurier (job IncludedInBlock/Finalized -> txHash). This is what
+    // the platform verifies against the registered key; without it the
+    // decision scores as "missing proof" (-2) even though the inline proof
+    // above is valid. Null (omitted) when Kurier is unconfigured or failed
+    // — the decision + inline proof are still returned.
+    if (proofTx) {
+      obj.proof_tx = proofTx;
+      obj.proofTx = proofTx;
+    }
   }
   const raw = JSON.stringify(obj);
   state.seenTasks[taskId] = { decision, raw };
@@ -388,6 +431,11 @@ const server = http.createServer(async (req, res) => {
 
 if (!HMAC_SECRET) {
   console.warn('[warn] AGENT_GAMES_HMAC_SECRET is not set — incoming tasks will get 401 until it is configured.');
+}
+if (kurier.isConfigured()) {
+  console.log(`[kurier] API key configured, base URL ${kurier.KURIER_API_URL} — decision proofs will be submitted on-chain (proof_tx).`);
+} else {
+  console.warn('[warn] KURIER_API_KEY is not set — decision proofs will NOT be submitted on-chain; scored rounds count each correct decision as missing proof (-2) with no reliability bonus. Get a mainnet key at https://kurier.xyz and set KURIER_API_KEY in .env.');
 }
 if (!fs.existsSync(WASM_PATH) || !fs.existsSync(ZKEY_PATH)) {
   console.warn('[warn] circuit files missing in circuits/ — proof generation will fail until gatekeeper.wasm + gatekeeper_final.zkey are present.');

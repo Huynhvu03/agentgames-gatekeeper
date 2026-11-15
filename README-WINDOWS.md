@@ -11,7 +11,12 @@ The PC, the server and the tunnel must stay on during those hours.
   HMAC signature on the raw body **before** parsing, decides
   APPROVE/REJECT with a deterministic checklist (no LLM), generates a
   Groth16 proof of the decision with snarkjs + the tournament's own
-  gatekeeper circuit, and returns the signed response — all within 60 s.
+  gatekeeper circuit, **submits that proof to zkVerify via Kurier and
+  returns the finalized on-chain reference as `proof_tx`** (without it,
+  scored rounds count the decision as "missing proof", −2 each — the
+  Round 03 lesson), and returns the signed response — all within 60 s.
+  If Kurier is down or unconfigured, the response still carries decision +
+  inline proof, just without `proof_tx`.
 - `POST /agent` also answers the platform's preflight
   (`{ok:true, protocolVersion:"v1"}`, signed).
 - `GET /health` (and `GET /agent`, `GET /`) — health check, returns 200.
@@ -65,6 +70,7 @@ Fill in:
 AGENT_GAMES_HMAC_SECRET=<paste the secret here>
 AGENT_ID=<agent id from the dashboard, optional>
 PORT=3000
+KURIER_API_KEY=<paste the Kurier mainnet API key here — see section 3b>
 ```
 
 **Where the secret comes from:** when the agent is registered on the
@@ -72,6 +78,43 @@ Agent Games dashboard (Dashboard → My Agents → Register agent), the platform
 generates a 32-byte HMAC secret and shows it **exactly once**. Copy it
 immediately into `.env`. Never commit `.env`, never paste the secret into
 chat, never put it in the repo. (`.env` is in `.gitignore`.)
+
+## 3b. Get a Kurier API key (REQUIRED — otherwise proofs score −2 each)
+
+Round 03 proved it: the platform verifies the decision proof from the
+**on-chain reference (`proof_tx`)**, not from the inline proof in the
+response. Every correct decision without `proof_tx` costs −2 and earns no
+reliability bonus (14 points lost in Round 03). The server now submits
+each decision proof to zkVerify via Kurier and returns the finalized tx
+hash as `proof_tx` — but it needs a mainnet Kurier API key:
+
+1. Open **https://kurier.xyz** in the browser, sign up (email), open the
+   user dashboard and create an API key. (No payment method is mentioned
+   in Kurier's docs; the key only submits proofs — it cannot move funds.)
+2. Paste the key into `.env` as `KURIER_API_KEY=<key>`.
+3. Restart the server (`npm start`). The startup log must say
+   `[kurier] API key configured ...` — if it says `KURIER_API_KEY is not
+   set`, the key did not load.
+4. Verify: run one **practice task** from the dashboard, then check the
+   server console — you must see a `[kurier] job ... status=Finalized`
+   line and a `[agent] kurier task ... proof_tx=0x...` line. The
+   practice-task result on the dashboard should show the proof verified.
+
+How it works (no action needed): on the first task the server registers
+the tournament's gatekeeper verification key with Kurier once
+(`register-vk`, cached for the process), then per task it submits the
+proof (`submit-proof`), polls `job-status` every 2 s until the tx is in
+a block (usually ~15 s), and returns the tx hash as `proof_tx`. The whole
+Kurier phase is capped at 30 s per task and the 60 s platform deadline is
+always respected — if Kurier is slow or down, the server still answers
+in time with decision + inline proof, just without `proof_tx`, and logs
+the reason. A retried task never re-submits: the cached response
+(including `proof_tx`) is returned from `state.json`.
+
+Optional tuning in `.env`: `KURIER_POLL_BUDGET_MS` (default 30000),
+`KURIER_POLL_INTERVAL_MS` (default 2000), `KURIER_API_URL` (default
+`https://api.kurier.xyz/api/v1`; testnet is
+`https://api-testnet.kurier.xyz/api/v1`).
 
 ## 4. Start the server
 
@@ -170,13 +213,15 @@ curl.exe https://<your-url>.trycloudflare.com/health
 
 ## Known gaps (read before the first scored round)
 
-1. **No Kurier API key.** The guide recommends submitting the decision
-   proof to zkVerify via Kurier (`POST api.kurier.xyz/api/v1/submit-proof/{KEY}`)
-   and returning `proof_tx`. No key was created (no sign-ups were made).
-   The server returns the Groth16 `proof` + `public_signals` directly for
-   the platform to verify — `proof_tx` is omitted (it is optional in the
-   response). If the platform ever requires a finalized on-chain proof
-   reference, obtain a Kurier mainnet API key and add the submission step.
+1. **Kurier API key — code DONE, key still needed.** The server now
+   submits every decision proof via Kurier and returns `proof_tx`
+   (`kurier.js`; tested with a mock Kurier: success / submit-fail /
+   job-fail / poll-timeout / replay paths, see `test-kurier.js`). What is
+   still missing is the real mainnet key: sign up at https://kurier.xyz
+   and put it in `.env` as `KURIER_API_KEY` (section 3b). Until then the
+   server answers with decision + inline proof only, and scored rounds
+   keep costing −2 per correct decision. The key has never been created
+   (no sign-ups were made by the agent).
 2. **No on-chain check of the task's own proof.** The guide suggests
    calling zkVerifyJS to confirm the task's `proof_tx` is on-chain with a
    matching VK. That check is not implemented: the `proof_tx` format is not
